@@ -13,7 +13,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaRelay
 from sdk.wsconnect import (
     connect, object_from_string, encode_mess,
-    pack_message, send_action, login
+    pack_message, send_action, login, exit_game
 )
 
 # --- 配置 ---
@@ -224,8 +224,15 @@ async def run_cloud_game(app: web.Application):
         await asyncio.Event().wait()
     finally:
         print(f"\n{Colors.CYAN}[*] Shutting down...{Colors.RESET}")
+
+        # 退出云游戏
+        #if token:
+        #    print(f"{Colors.CYAN}[*] Exiting cloud game...{Colors.RESET}")
+        #    # 使用 run_in_executor 避免阻塞事件循环
+        #    loop = asyncio.get_running_loop()
+        #    await loop.run_in_executor(None, exit_game, token)
         
-        async def close_with_timeout(awaitable, timeout=5.0):
+        async def close_with_timeout(awaitable, timeout=8.0):
             try:
                 await asyncio.wait_for(awaitable, timeout=timeout)
             except (asyncio.TimeoutError, asyncio.CancelledError):
