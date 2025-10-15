@@ -3,6 +3,7 @@ import json
 import time
 import sys
 import platform
+import logging
 from typing import Optional
 from io import BytesIO
 
@@ -18,7 +19,7 @@ from sdk.wsconnect import (
 # --- 配置 ---
 GAME_CODE = "mrfz"
 TOKEN_FILE = "token"
-HOST = "localhost"
+HOST = "127.0.0.1"
 PORT = 22888
 WIDTH = 1280
 HEIGHT = 720
@@ -250,10 +251,18 @@ async def handle_key(request: web.Request):
     # todo
     return web.json_response({"status": "ok"})
 
+async def handle_root(request: web.Request):
+    raise web.HTTPMovedPermanently('/screencap')
+
 # --- 主函数 ---
 def main():
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    access_log = logging.getLogger("aiohttp.access")
+
     app = web.Application()
     app.add_routes([
+        web.get('/', handle_root),
         web.get('/info', handle_info),
         web.get('/screencap', handle_screencap),
         web.post('/click', handle_click),
@@ -265,7 +274,7 @@ def main():
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(cleanup_background_tasks)
     
-    web.run_app(app, host=HOST, port=PORT)
+    web.run_app(app, host=HOST, port=PORT, access_log=access_log)
 
 if __name__ == "__main__":
     main()
