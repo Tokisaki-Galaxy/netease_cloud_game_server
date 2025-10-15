@@ -4,7 +4,7 @@ import time
 import sys
 import platform
 import logging
-from typing import Optional
+from typing import Optional, Coroutine
 from io import BytesIO
 
 from aiohttp import web
@@ -46,6 +46,16 @@ class AppState:
         self.is_ready = False
         self.width = WIDTH
         self.height = HEIGHT
+        self.token: Optional[str] = None
+        self.cloud_game_task: Optional[asyncio.Task] = None
+
+    def reset(self):
+        self.pc = None
+        self.sock = None
+        self.snapshotter = None
+        self.is_ready = False
+        self.token = None
+        self.cloud_game_task = None
 
 app_state = AppState()
 
@@ -71,6 +81,8 @@ class VideoSnapshotter:
                 self._last_frame = frame
                 if not self._got_first.is_set():
                     self._got_first.set()
+        except asyncio.CancelledError:
+            pass # 任务被取消是正常的
         except Exception:
             pass
 
@@ -82,7 +94,8 @@ class VideoSnapshotter:
             return False
 
     async def snapshot_bytes(self, fmt="jpeg") -> Optional[bytes]:
-        await self._got_first.wait()
+        if not self._got_first.is_set():
+            return None
         frame = self._last_frame
         if frame is None:
             return None
@@ -109,9 +122,9 @@ class VideoSnapshotter:
 async def handle_info(request: web.Request):
     if not app_state.is_ready:
         return web.json_response({
-            "status": "error",
-            "message": "Cloud gaming service not connected"
-        }, status=500)
+            "status": "connecting" if app_state.cloud_game_task and not app_state.cloud_game_task.done() else "disconnected",
+            "message": "Cloud gaming service not ready or not connected."
+        })
     
     return web.json_response({
         "status": "ok",
@@ -121,7 +134,7 @@ async def handle_info(request: web.Request):
 
 async def handle_screencap(request: web.Request):
     if not app_state.is_ready or not app_state.snapshotter:
-        return web.json_response({"status": "error", "message": "Service not ready"}, status=500)
+        return web.json_response({"status": "error", "message": "Service not ready"}, status=503)
 
     image_bytes = await app_state.snapshotter.snapshot_bytes(fmt="jpeg")
     if not image_bytes:
@@ -131,7 +144,7 @@ async def handle_screencap(request: web.Request):
 
 async def handle_click(request: web.Request):
     if not app_state.is_ready or not app_state.sock:
-        return web.json_response({"status": "error", "message": "Service not ready"}, status=500)
+        return web.json_response({"status": "error", "message": "Service not ready"}, status=503)
     
     try:
         data = await request.json()
@@ -139,14 +152,14 @@ async def handle_click(request: web.Request):
     except (json.JSONDecodeError, KeyError, ValueError):
         return web.json_response({"status": "error", "message": "Invalid request body"}, status=400)
 
-    logging.info(f"Action: Click at ({x}, {y})")
+    logging.warning(f"Action: Click at ({x}, {y})")
     action = pack_message("cm", {"x": x, "y": y})
     await send_action(app_state.sock, action)
     return web.json_response({"status": "ok"})
 
 async def handle_swipe(request: web.Request):
     if not app_state.is_ready or not app_state.sock:
-        return web.json_response({"status": "error", "message": "Service not ready"}, status=500)
+        return web.json_response({"status": "error", "message": "Service not ready"}, status=503)
 
     try:
         data = await request.json()
@@ -168,95 +181,9 @@ async def handle_swipe(request: web.Request):
         
     return web.json_response({"status": "ok"})
 
-# --- 云游戏连接逻辑 ---
-async def run_cloud_game(app: web.Application):
-    try:
-        token = open(TOKEN_FILE).read().strip()
-    except FileNotFoundError:
-        token = ""
-    if not token:
-        pnum = input(f"{Colors.YELLOW}input your phone number: {Colors.RESET}").strip()
-        login("86-" + pnum)
-        token = open(TOKEN_FILE).read().strip()
-        if not token:
-            print(f"{Colors.RED}Login failed, exiting.{Colors.RESET}", file=sys.stderr)
-            sys.exit(1)
-
-    print(f"{Colors.CYAN}[*] Connecting to cloud gaming service...{Colors.RESET}")
-    res, sock = await connect(token, GAME_CODE, w=app_state.width, h=app_state.height)
-    remote = object_from_string(res)
-    
-    pc = RTCPeerConnection()
-    relay = MediaRelay()
-
-    @pc.on("track")
-    def on_track(track):
-        if track.kind == "video":
-            print(f"{Colors.BLUE}[*] Video track received.{Colors.RESET}")
-            app_state.snapshotter = VideoSnapshotter(relay.subscribe(track))
-            app_state.snapshotter.start()
-
-    await pc.setRemoteDescription(remote)
-    answer = await pc.createAnswer()
-    patched = RTCSessionDescription(
-        sdp=answer.sdp.replace("a=setup:active", "a=setup:passive"),
-        type=answer.type,
-    )
-    await pc.setLocalDescription(patched)
-    msg = {"id": str(int(time.time() * 1000)), "op": "answer", "data": {"sdp": patched.sdp}}
-    await sock.send(encode_mess(json.dumps(msg)))
-
-    app_state.pc = pc
-    app_state.sock = sock
-
-    print(f"{Colors.YELLOW}[*] Waiting for video stream...{Colors.RESET}")
-    if not app_state.snapshotter:
-        await asyncio.sleep(3)
-    
-    if app_state.snapshotter and await app_state.snapshotter.wait_ready():
-        app_state.is_ready = True
-        print(f"{Colors.GREEN}{Colors.BOLD}[✓] Service ready. API server is running at http://{HOST}:{PORT}{Colors.RESET}")
-    else:
-        print(f"{Colors.RED}[!] Failed to start video stream. API will not be fully functional.{Colors.RESET}", file=sys.stderr)
-
-    # 保持连接
-    try:
-        await asyncio.Event().wait()
-    finally:
-        print(f"\n{Colors.CYAN}[*] Shutting down...{Colors.RESET}")
-
-        # 退出云游戏
-        #if token:
-        #    print(f"{Colors.CYAN}[*] Exiting cloud game...{Colors.RESET}")
-        #    # 使用 run_in_executor 避免阻塞事件循环
-        #    loop = asyncio.get_running_loop()
-        #    await loop.run_in_executor(None, exit_game, token)
-        
-        async def close_with_timeout(awaitable, timeout=8.0):
-            try:
-                await asyncio.wait_for(awaitable, timeout=timeout)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                print(f"{Colors.YELLOW}[!] Timeout or cancelled while closing resource.{Colors.RESET}", file=sys.stderr)
-            except Exception as e:
-                print(f"{Colors.RED}[!] Error closing resource: {e}{Colors.RESET}", file=sys.stderr)
-
-        if app_state.snapshotter:
-            await close_with_timeout(app_state.snapshotter.stop())
-        if pc and pc.connectionState != "closed":
-            await close_with_timeout(pc.close())
-        if sock and not sock.closed:
-            await close_with_timeout(sock.close())
-
-async def start_background_tasks(app: web.Application):
-    app['cloud_game_task'] = asyncio.create_task(run_cloud_game(app))
-
-async def cleanup_background_tasks(app: web.Application):
-    app['cloud_game_task'].cancel()
-    await app['cloud_game_task']
-
 async def handle_input(request: web.Request):
     if not app_state.is_ready or not app_state.sock:
-        return web.json_response({"status": "error", "message": "Service not ready"}, status=500)
+        return web.json_response({"status": "error", "message": "Service not ready"}, status=503)
 
     try:
         data = await request.json()
@@ -271,20 +198,138 @@ async def handle_input(request: web.Request):
 
     return web.json_response({"status": "ok"})
 
-async def handle_key(request: web.Request):
-    if not app_state.is_ready or not app_state.sock:
-        return web.json_response({"status": "error", "message": "Service not ready"}, status=500)
-    # todo
-    return web.json_response({"status": "ok"})
+async def handle_start(request: web.Request):
+    if app_state.cloud_game_task and not app_state.cloud_game_task.done():
+        return web.json_response({"status": "error", "message": "Cloud game connection is already in progress or active."}, status=409)
+
+    app_state.cloud_game_task = asyncio.create_task(run_cloud_game())
+    return web.json_response({"status": "ok", "message": "Cloud game connection initiated."})
+
+async def handle_exit(request: web.Request):
+    if not app_state.cloud_game_task or app_state.cloud_game_task.done():
+        return web.json_response({"status": "ok", "message": "No active cloud game connection to exit."})
+
+    print(f"{Colors.CYAN}[*] Received exit request. Disconnecting from cloud game...{Colors.RESET}")
+    
+    app_state.cloud_game_task.cancel()
+    try:
+        await app_state.cloud_game_task
+    except asyncio.CancelledError:
+        pass # Expected
+    
+    return web.json_response({"status": "ok", "message": "Cloud game connection terminated."})
 
 async def handle_root(request: web.Request):
-    raise web.HTTPMovedPermanently('/screencap')
+    raise web.HTTPMovedPermanently('/info')
+
+# --- 云游戏连接逻辑 ---
+async def run_cloud_game():
+    try:
+        try:
+            token = open(TOKEN_FILE).read().strip()
+        except FileNotFoundError:
+            token = ""
+        if not token:
+            pnum = input(f"{Colors.YELLOW}Input your phone number (will not be stored): {Colors.RESET}").strip()
+            login("86-" + pnum)
+            token = open(TOKEN_FILE).read().strip()
+            if not token:
+                print(f"{Colors.RED}Login failed, exiting task.{Colors.RESET}", file=sys.stderr)
+                return
+
+        app_state.token = token
+        print(f"{Colors.CYAN}[*] Connecting to cloud gaming service...{Colors.RESET}")
+        res, sock = await connect(token, GAME_CODE, w=app_state.width, h=app_state.height)
+        remote = object_from_string(res)
+        
+        pc = RTCPeerConnection()
+        relay = MediaRelay()
+
+        @pc.on("track")
+        def on_track(track):
+            if track.kind == "video":
+                print(f"{Colors.BLUE}[*] Video track received.{Colors.RESET}")
+                app_state.snapshotter = VideoSnapshotter(relay.subscribe(track))
+                app_state.snapshotter.start()
+
+        await pc.setRemoteDescription(remote)
+        answer = await pc.createAnswer()
+        patched = RTCSessionDescription(
+            sdp=answer.sdp.replace("a=setup:active", "a=setup:passive"),
+            type=answer.type,
+        )
+        await pc.setLocalDescription(patched)
+        msg = {"id": str(int(time.time() * 1000)), "op": "answer", "data": {"sdp": patched.sdp}}
+        await sock.send(encode_mess(json.dumps(msg)))
+
+        app_state.pc = pc
+        app_state.sock = sock
+
+        print(f"{Colors.YELLOW}[*] Waiting for video stream...{Colors.RESET}")
+        if not app_state.snapshotter:
+            await asyncio.sleep(3)
+        
+        if app_state.snapshotter and await app_state.snapshotter.wait_ready():
+            app_state.is_ready = True
+            print(f"{Colors.GREEN}{Colors.BOLD}[✓] Cloud game ready. API is active.{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}[!] Failed to start video stream. API will not be functional.{Colors.RESET}", file=sys.stderr)
+
+        await asyncio.Event().wait()
+
+    except asyncio.CancelledError:
+        print(f"\n{Colors.CYAN}[*] Cloud game task cancelled.{Colors.RESET}")
+    except Exception as e:
+        print(f"\n{Colors.RED}[!] An error occurred in cloud game task: {e}{Colors.RESET}", file=sys.stderr)
+        logging.exception("Cloud game task error")
+    finally:
+        print(f"{Colors.CYAN}[*] Cleaning up cloud game resources...{Colors.RESET}")
+        
+        token_to_use = app_state.token
+        pc_to_close = app_state.pc
+        sock_to_close = app_state.sock
+        snapshotter_to_stop = app_state.snapshotter
+
+        # 重置状态
+        app_state.reset()
+
+        if token_to_use:
+            print(f"{Colors.CYAN}[*] Sending exit command to cloud game server...{Colors.RESET}")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, exit_game, token_to_use)
+        
+        async def close_with_timeout(awaitable: Coroutine, timeout=5.0):
+            try:
+                await asyncio.wait_for(awaitable, timeout=timeout)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                pass
+
+        if snapshotter_to_stop:
+            await close_with_timeout(snapshotter_to_stop.stop())
+        if pc_to_close and pc_to_close.connectionState != "closed":
+            await close_with_timeout(pc_to_close.close())
+        if sock_to_close and not sock_to_close.closed:
+            await close_with_timeout(sock_to_close.close())
+        
+        print(f"{Colors.GREEN}[✓] Cloud game resources cleaned up.{Colors.RESET}")
+
+
+async def cleanup_background_tasks(app: web.Application):
+    if app_state.cloud_game_task and not app_state.cloud_game_task.done():
+        print(f"\n{Colors.CYAN}Server shutting down. Cleaning up active cloud game connection...{Colors.RESET}")
+        app_state.cloud_game_task.cancel()
+        try:
+            await app_state.cloud_game_task
+        except asyncio.CancelledError:
+            pass
 
 # --- 主函数 ---
 def main():
     logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    access_log = logging.getLogger("aiohttp.access")
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+    access_log = logging.getLogger("aiohttp.access")#.setLevel(logging.WARNING)
 
     app = web.Application()
     app.add_routes([
@@ -294,11 +339,14 @@ def main():
         web.post('/click', handle_click),
         web.post('/swipe', handle_swipe),
         web.post('/input', handle_input),
-        web.post('/key', handle_key),
+        web.post('/start', handle_start),
+        web.post('/exit', handle_exit),
     ])
     
-    app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(cleanup_background_tasks)
+    
+    print(f"{Colors.GREEN}{Colors.BOLD}[✓] API server is running at http://{HOST}:{PORT}{Colors.RESET}")
+    print(f"{Colors.YELLOW}Send POST to /start to connect to the cloud game.{Colors.RESET}")
     
     web.run_app(app, host=HOST, port=PORT, access_log=access_log)
 
