@@ -139,6 +139,7 @@ async def handle_click(request: web.Request):
     except (json.JSONDecodeError, KeyError, ValueError):
         return web.json_response({"status": "error", "message": "Invalid request body"}, status=400)
 
+    logging.info(f"Action: Click at ({x}, {y})")
     action = pack_message("cm", {"x": x, "y": y})
     await send_action(app_state.sock, action)
     return web.json_response({"status": "ok"})
@@ -223,13 +224,21 @@ async def run_cloud_game(app: web.Application):
         await asyncio.Event().wait()
     finally:
         print(f"\n{Colors.CYAN}[*] Shutting down...{Colors.RESET}")
+        
+        async def close_with_timeout(awaitable, timeout=5.0):
+            try:
+                await asyncio.wait_for(awaitable, timeout=timeout)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                print(f"{Colors.YELLOW}[!] Timeout or cancelled while closing resource.{Colors.RESET}", file=sys.stderr)
+            except Exception as e:
+                print(f"{Colors.RED}[!] Error closing resource: {e}{Colors.RESET}", file=sys.stderr)
+
         if app_state.snapshotter:
-            await app_state.snapshotter.stop()
+            await close_with_timeout(app_state.snapshotter.stop())
         if pc and pc.connectionState != "closed":
-            await pc.close()
+            await close_with_timeout(pc.close())
         if sock and not sock.closed:
-            await sock.close()
-        print(f"{Colors.GREEN}[✓] Cloud game connection closed.{Colors.RESET}")
+            await close_with_timeout(sock.close())
 
 async def start_background_tasks(app: web.Application):
     app['cloud_game_task'] = asyncio.create_task(run_cloud_game(app))
