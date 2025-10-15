@@ -24,6 +24,16 @@ PORT = 22888
 WIDTH = 1280
 HEIGHT = 720
 
+# --- 颜色定义 ---
+class Colors:
+    RESET = '\033[0m'
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    CYAN = '\033[36m'
+    BOLD = '\033[1m'
+
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -164,14 +174,14 @@ async def run_cloud_game(app: web.Application):
     except FileNotFoundError:
         token = ""
     if not token:
-        pnum = input("input your phone number: ").strip()
+        pnum = input(f"{Colors.YELLOW}input your phone number: {Colors.RESET}").strip()
         login("86-" + pnum)
         token = open(TOKEN_FILE).read().strip()
         if not token:
-            print("Login failed, exiting.", file=sys.stderr)
+            print(f"{Colors.RED}Login failed, exiting.{Colors.RESET}", file=sys.stderr)
             sys.exit(1)
 
-    print("[*] Connecting to cloud gaming service...")
+    print(f"{Colors.CYAN}[*] Connecting to cloud gaming service...{Colors.RESET}")
     res, sock = await connect(token, GAME_CODE, w=app_state.width, h=app_state.height)
     remote = object_from_string(res)
     
@@ -181,7 +191,7 @@ async def run_cloud_game(app: web.Application):
     @pc.on("track")
     def on_track(track):
         if track.kind == "video":
-            print("[*] Video track received.")
+            print(f"{Colors.BLUE}[*] Video track received.{Colors.RESET}")
             app_state.snapshotter = VideoSnapshotter(relay.subscribe(track))
             app_state.snapshotter.start()
 
@@ -198,28 +208,28 @@ async def run_cloud_game(app: web.Application):
     app_state.pc = pc
     app_state.sock = sock
 
-    print("[*] Waiting for video stream...")
+    print(f"{Colors.YELLOW}[*] Waiting for video stream...{Colors.RESET}")
     if not app_state.snapshotter:
         await asyncio.sleep(3)
     
     if app_state.snapshotter and await app_state.snapshotter.wait_ready():
         app_state.is_ready = True
-        print(f"[✓] Service ready. API server is running at http://{HOST}:{PORT}")
+        print(f"{Colors.GREEN}{Colors.BOLD}[✓] Service ready. API server is running at http://{HOST}:{PORT}{Colors.RESET}")
     else:
-        print("[!] Failed to start video stream. API will not be fully functional.", file=sys.stderr)
+        print(f"{Colors.RED}[!] Failed to start video stream. API will not be fully functional.{Colors.RESET}", file=sys.stderr)
 
     # 保持连接
     try:
         await asyncio.Event().wait()
     finally:
-        print("\n[*] Shutting down...")
+        print(f"\n{Colors.CYAN}[*] Shutting down...{Colors.RESET}")
         if app_state.snapshotter:
             await app_state.snapshotter.stop()
         if pc and pc.connectionState != "closed":
             await pc.close()
         if sock and not sock.closed:
             await sock.close()
-        print("[✓] Cloud game connection closed.")
+        print(f"{Colors.GREEN}[✓] Cloud game connection closed.{Colors.RESET}")
 
 async def start_background_tasks(app: web.Application):
     app['cloud_game_task'] = asyncio.create_task(run_cloud_game(app))
