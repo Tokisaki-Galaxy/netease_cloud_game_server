@@ -153,8 +153,16 @@ async def handle_click(request: web.Request):
         return web.json_response({"status": "error", "message": "Invalid request body"}, status=400)
 
     logging.warning(f"Action: Click at ({x}, {y})")
-    action = pack_message("cm", {"x": x, "y": y})
-    await send_action(app_state.sock, action)
+    
+    # 1. 先移动鼠标到目标位置
+    move_action = pack_message("mm", {"x": x, "y": y})
+    await send_action(app_state.sock, move_action)
+    await asyncio.sleep(0.05) # 短暂等待，模拟真实操作
+
+    # 2. 再执行点击操作
+    click_action = pack_message("cm", {"x": x, "y": y})
+    await send_action(app_state.sock, click_action)
+    
     return web.json_response({"status": "ok"})
 
 async def handle_swipe(request: web.Request):
@@ -165,19 +173,34 @@ async def handle_swipe(request: web.Request):
         data = await request.json()
         x1, y1 = int(data['x1']), int(data['y1'])
         x2, y2 = int(data['x2']), int(data['y2'])
-        duration = int(data['duration'])
+        duration_ms = int(data['duration'])
     except (json.JSONDecodeError, KeyError, ValueError):
         return web.json_response({"status": "error", "message": "Invalid request body"}, status=400)
 
-    # aiortc/webrtc 不直接支持滑动，通过一系列快速的鼠标移动来模拟
-    steps = max(2, int(duration / 50)) # 每50ms移动一次
-    for i in range(steps + 1):
+    logging.warning(f"Action: Swipe from ({x1}, {y1}) to ({x2}, {y2}) in {duration_ms}ms")
+
+    # 模拟滑动需要 "按下 -> 移动 -> 松开"
+    # cmd "2" for mouse down, "4" for mouse up.
+    
+    # 1. 移动到起点并按下
+    await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"1 {x1} {y1} 0"}})
+    await asyncio.sleep(0.02)
+    await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"2 {x1} {y1} 0"}})
+    await asyncio.sleep(0.05)
+
+    # 2. 模拟拖动过程 (一系列移动)
+    steps = max(2, int(duration_ms / 20)) # 每20ms移动一次
+    for i in range(1, steps + 1):
         progress = i / steps
         x = int(x1 + (x2 - x1) * progress)
         y = int(y1 + (y2 - y1) * progress)
-        action = pack_message("mm", {"x": x, "y": y})
-        await send_action(app_state.sock, action)
-        await asyncio.sleep(duration / 1000 / steps)
+        # 在拖动过程中，我们仍然发送移动指令
+        await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"1 {x} {y} 0"}})
+        await asyncio.sleep(duration_ms / 1000 / steps)
+
+    # 3. 在终点松开
+    await asyncio.sleep(0.02)
+    await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"4 {x2} {y2} 0"}})
         
     return web.json_response({"status": "ok"})
 
