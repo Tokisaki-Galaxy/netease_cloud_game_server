@@ -319,7 +319,7 @@ async def run_cloud_game():
         if token_to_use:
             print(f"{Colors.CYAN}[*] Sending exit command to cloud game server...{Colors.RESET}")
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, exit_game, token_to_use)
+            await loop.run_in_executor(None, exit_game, token_to_use, GAME_CODE)
         
         async def close_with_timeout(awaitable: Coroutine, timeout=5.0):
             try:
@@ -333,7 +333,7 @@ async def run_cloud_game():
             await close_with_timeout(snapshotter_to_stop.stop())
         if pc_to_close and pc_to_close.connectionState != "closed":
             await close_with_timeout(pc_to_close.close())
-        if sock_to_close and not sock_to_close.closed:
+        if sock_to_close and sock_to_close.close_code is None:
             await close_with_timeout(sock_to_close.close())
         
         print(f"{Colors.GREEN}[✓] Cloud game resources cleaned up.{Colors.RESET}")
