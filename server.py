@@ -5,6 +5,10 @@ import sys
 import platform
 import logging
 from typing import Optional, Coroutine
+try:
+    from websockets.legacy.client import WebSocketClientProtocol
+except ImportError:  # websockets >=12 removed legacy package
+    from websockets.client import WebSocketClientProtocol  # type: ignore[attr-defined]
 from io import BytesIO
 
 from aiohttp import web
@@ -41,7 +45,7 @@ if platform.system() == "Windows":
 class AppState:
     def __init__(self):
         self.pc: Optional[RTCPeerConnection] = None
-        self.sock: Optional[web.WebSocketResponse] = None
+        self.sock: Optional[WebSocketClientProtocol] = None
         self.snapshotter: Optional['VideoSnapshotter'] = None
         self.is_ready = False
         self.width = WIDTH
@@ -264,6 +268,8 @@ async def run_cloud_game():
         print(f"{Colors.CYAN}[*] Connecting to cloud gaming service...{Colors.RESET}")
         res, sock = await connect(token, GAME_CODE, w=app_state.width, h=app_state.height)
         remote = object_from_string(res)
+        if not isinstance(remote, RTCSessionDescription):
+            raise RuntimeError(f"Unexpected offer type from signaling: {type(remote)!r}")
         
         pc = RTCPeerConnection()
         relay = MediaRelay()
@@ -277,6 +283,8 @@ async def run_cloud_game():
 
         await pc.setRemoteDescription(remote)
         answer = await pc.createAnswer()
+        if answer is None:
+            raise RuntimeError("Failed to create SDP answer")
         patched = RTCSessionDescription(
             sdp=answer.sdp.replace("a=setup:active", "a=setup:passive"),
             type=answer.type,
