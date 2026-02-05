@@ -71,6 +71,7 @@ class VideoSnapshotter:
         self._last_frame = None
         self._got_first = asyncio.Event()
         self._running = False
+        self._last_recv_ts: float = 0.0
 
     def start(self):
         if self._task:
@@ -83,6 +84,7 @@ class VideoSnapshotter:
             while self._running:
                 frame = await self._track.recv()
                 self._last_frame = frame
+                self._last_recv_ts = time.time()
                 if not self._got_first.is_set():
                     self._got_first.set()
         except asyncio.CancelledError:
@@ -99,6 +101,12 @@ class VideoSnapshotter:
 
     async def snapshot_bytes(self, fmt="jpeg") -> Optional[bytes]:
         if not self._got_first.is_set():
+            return None
+        if self._last_recv_ts and time.time() - self._last_recv_ts > 10:
+            self._last_frame = None
+            if app_state.is_ready:
+                app_state.is_ready = False
+                logging.warning("Video stream stale for over 10s; marking service as not ready")
             return None
         frame = self._last_frame
         if frame is None:
@@ -184,28 +192,23 @@ async def handle_swipe(request: web.Request):
     logging.warning(f"Action: Swipe from ({x1}, {y1}) to ({x2}, {y2}) in {duration_ms}ms")
 
     # 模拟滑动需要 "按下 -> 移动 -> 松开"
-    # cmd "2" for mouse down, "4" for mouse up.
-    
-    # 1. 移动到起点并按下
-    await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"1 {x1} {y1} 0"}})
-    await asyncio.sleep(0.02)
-    await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"2 {x1} {y1} 0"}})
-    await asyncio.sleep(0.05)
+    # 1. 先移动鼠标到目标位置
+    move_action = pack_message("mm", {"x": x1, "y": y1})
+    await send_action(app_state.sock, move_action)
+    await asyncio.sleep(0.05) # 短暂等待，模拟真实操作
 
-    # 2. 模拟拖动过程 (一系列移动)
-    steps = max(2, int(duration_ms / 20)) # 每20ms移动一次
-    for i in range(1, steps + 1):
-        progress = i / steps
-        x = int(x1 + (x2 - x1) * progress)
-        y = int(y1 + (y2 - y1) * progress)
-        # 在拖动过程中，我们仍然发送移动指令
-        await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"1 {x} {y} 0"}})
-        await asyncio.sleep(duration_ms / 1000 / steps)
+    # 2. 再执行点击操作
+    click_action = pack_message("cm", {"x": x1, "y": y1})
+    await send_action(app_state.sock, click_action)
 
-    # 3. 在终点松开
-    await asyncio.sleep(0.02)
-    await send_action(app_state.sock, {"id": str(int(time.time() * 1000)), "op": "input", "data": {"cmd": f"4 {x2} {y2} 0"}})
-        
+    # 3. 再执行移动操作
+    click_action = pack_message("cm", {"x": x1, "y": y1})
+    await send_action(app_state.sock, click_action)
+
+    # 4. 再执行点击操作
+    click_action = pack_message("cm", {"x": x1, "y": y1})
+    await send_action(app_state.sock, click_action)
+
     return web.json_response({"status": "ok"})
 
 async def handle_input(request: web.Request):
@@ -227,7 +230,10 @@ async def handle_input(request: web.Request):
 
 async def handle_start(request: web.Request):
     if app_state.cloud_game_task and not app_state.cloud_game_task.done():
-        return web.json_response({"status": "error", "message": "Cloud game connection is already in progress or active."}, status=409)
+        return web.json_response({"status": "ok", "message": "Cloud game connection already active."})
+
+    if app_state.cloud_game_task and app_state.cloud_game_task.done():
+        app_state.cloud_game_task = None
 
     app_state.cloud_game_task = asyncio.create_task(run_cloud_game())
     return web.json_response({"status": "ok", "message": "Cloud game connection initiated."})
