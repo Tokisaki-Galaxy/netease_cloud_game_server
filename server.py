@@ -201,7 +201,7 @@ async def handle_swipe(request: web.Request):
     height = app_state.height
     
     # Calculate number of steps based on duration (aim for ~20-50ms per step)
-    steps = max(1, duration_ms // 30)
+    steps = max(1, int(duration_ms) // 30)
     step_delay = duration_ms / 1000.0 / steps
     
     # 1. Touch down at start position
@@ -421,7 +421,9 @@ async def run_server():
         print(f"\n{Colors.CYAN}[*] Shutdown signal received...{Colors.RESET}")
         shutdown_event.set()
     
-    # Register signal handlers (not available on Windows)
+    # Register signal handlers
+    # Note: loop.add_signal_handler() is not supported on Windows event loops,
+    # so the KeyboardInterrupt fallback in main() is needed for Windows support
     if platform.system() != "Windows":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, signal_handler)
