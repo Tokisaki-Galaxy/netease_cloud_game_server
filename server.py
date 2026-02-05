@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import sys
+import signal
 import platform
 import logging
 from typing import Optional, Coroutine
@@ -52,6 +53,7 @@ class AppState:
         self.height = HEIGHT
         self.token: Optional[str] = None
         self.cloud_game_task: Optional[asyncio.Task] = None
+        self.shutdown_event: Optional[asyncio.Event] = None
 
     def reset(self):
         self.pc = None
@@ -191,23 +193,36 @@ async def handle_swipe(request: web.Request):
 
     logging.warning(f"Action: Swipe from ({x1}, {y1}) to ({x2}, {y2}) in {duration_ms}ms")
 
-    # 模拟滑动需要 "按下 -> 移动 -> 松开"
-    # 1. 先移动鼠标到目标位置
-    move_action = pack_message("mm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, move_action)
-    await asyncio.sleep(0.05) # 短暂等待，模拟真实操作
-
-    # 2. 再执行点击操作
-    click_action = pack_message("cm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, click_action)
-
-    # 3. 再执行移动操作
-    click_action = pack_message("cm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, click_action)
-
-    # 4. 再执行点击操作
-    click_action = pack_message("cm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, click_action)
+    # Swipe simulation: touch down -> touch move(s) -> touch up
+    # Use multiple intermediate points for smoother swipe
+    
+    # Get screen dimensions for coordinate normalization
+    width = app_state.width
+    height = app_state.height
+    
+    # Calculate number of steps based on duration (aim for ~20-50ms per step)
+    steps = max(1, duration_ms // 30)
+    step_delay = duration_ms / 1000.0 / steps
+    
+    # 1. Touch down at start position
+    touch_down = pack_message("td", {"x": x1, "y": y1, "pointer_id": 0, "width": width, "height": height})
+    await send_action(app_state.sock, touch_down)
+    await asyncio.sleep(0.02)
+    
+    # 2. Touch move through intermediate points
+    for i in range(1, steps + 1):
+        # Linear interpolation between start and end points
+        t = i / steps
+        x = int(x1 + (x2 - x1) * t)
+        y = int(y1 + (y2 - y1) * t)
+        
+        touch_move = pack_message("tm", {"x": x, "y": y, "pointer_id": 0, "width": width, "height": height})
+        await send_action(app_state.sock, touch_move)
+        await asyncio.sleep(step_delay)
+    
+    # 3. Touch up at end position
+    touch_up = pack_message("tu", {"x": x2, "y": y2, "pointer_id": 0, "width": width, "height": height})
+    await send_action(app_state.sock, touch_up)
 
     return web.json_response({"status": "ok"})
 
@@ -312,7 +327,10 @@ async def run_cloud_game():
         else:
             print(f"{Colors.RED}[!] Failed to start video stream. API will not be functional.{Colors.RESET}", file=sys.stderr)
 
-        await asyncio.Event().wait()
+        # Use a cancellable wait instead of Event().wait()
+        # This allows the task to be properly cancelled by signals
+        while True:
+            await asyncio.sleep(1)
 
     except asyncio.CancelledError:
         print(f"\n{Colors.CYAN}[*] Cloud game task cancelled.{Colors.RESET}")
@@ -363,10 +381,11 @@ async def cleanup_background_tasks(app: web.Application):
             pass
 
 # --- 主函数 ---
-def main():
+async def run_server():
+    """Run the aiohttp server with proper signal handling."""
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s')
-    access_log = logging.getLogger("aiohttp.access")#.setLevel(logging.WARNING)
+    access_log = logging.getLogger("aiohttp.access")
 
     app = web.Application()
     app.add_routes([
@@ -382,10 +401,54 @@ def main():
     
     app.on_cleanup.append(cleanup_background_tasks)
     
+    runner = web.AppRunner(app, access_log=access_log)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    
     print(f"{Colors.GREEN}{Colors.BOLD}[✓] API server is running at http://{HOST}:{PORT}{Colors.RESET}")
     print(f"{Colors.YELLOW}Send POST to /start to connect to the cloud game.{Colors.RESET}")
+    print(f"{Colors.YELLOW}(Press CTRL+C to quit){Colors.RESET}")
     
-    web.run_app(app, host=HOST, port=PORT, access_log=access_log)
+    # Create shutdown event
+    shutdown_event = asyncio.Event()
+    
+    # Setup signal handlers
+    loop = asyncio.get_running_loop()
+    
+    def signal_handler():
+        print(f"\n{Colors.CYAN}[*] Shutdown signal received...{Colors.RESET}")
+        shutdown_event.set()
+    
+    # Register signal handlers (not available on Windows)
+    if platform.system() != "Windows":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
+    
+    try:
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print(f"{Colors.CYAN}[*] Shutting down server...{Colors.RESET}")
+        # Cleanup cloud game task if running
+        if app_state.cloud_game_task and not app_state.cloud_game_task.done():
+            app_state.cloud_game_task.cancel()
+            try:
+                await app_state.cloud_game_task
+            except asyncio.CancelledError:
+                pass
+        await runner.cleanup()
+        print(f"{Colors.GREEN}[✓] Server stopped.{Colors.RESET}")
+
+def main():
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        # This handles Ctrl+C on Windows
+        print(f"\n{Colors.GREEN}[✓] Server stopped by user.{Colors.RESET}")
 
 if __name__ == "__main__":
     main()
