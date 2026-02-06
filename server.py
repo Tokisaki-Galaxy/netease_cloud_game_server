@@ -257,30 +257,21 @@ async def handle_swipe(request: web.Request):
 
     logging.warning(f"Action: Swipe from ({start_x}, {start_y}) to ({end_x}, {end_y}) in {swipe_duration}ms")
 
-    # Cloud game touch protocol:
+    # Cloud game touch protocol (reverse engineered from cg.163.com):
     # - Event codes: down=1, move=2, up=3
-    # - Coordinates must be normalized to 0-65535 range
-    # - Formula: normalized = 65535 * pixel // dimension
-
-    def normalize_coord(pixel_val: int, dimension: int) -> int:
-        """Normalize pixel coordinate to 0-65535 range"""
-        clamped = max(0, min(pixel_val, dimension - 1))
-        return int((65535 * clamped) // dimension)
-
-    # Get current screen dimensions
-    screen_width = app_state.width
-    screen_height = app_state.height
+    # - Coordinates use raw video pixel values (same as click/mm/cm commands)
+    #   The JS client's send_touchstart/move/end_message functions call
+    #   this.transform() (display→video coords) but NOT getPercentPos()
+    #   (0-65535 normalization is only used for PC mouse events, codes 100+).
 
     num_points = max(5, swipe_duration // 30)
     interval = swipe_duration / 1000.0 / num_points
     touch_id = 0
 
     def create_touch_cmd(evt_type: int, px: int, py: int, tid: int) -> dict:
-        """Create touch input command with normalized coordinates"""
-        norm_x = normalize_coord(px, screen_width)
-        norm_y = normalize_coord(py, screen_height)
+        """Create touch input command with raw video pixel coordinates"""
         timestamp = str(int(time.time() * 1000))
-        cmd_str = f"{evt_type} {norm_x} {norm_y} {tid}"
+        cmd_str = f"{evt_type} {px} {py} {tid}"
         return {"id": timestamp, "op": "input", "data": {"cmd": cmd_str}}
 
     # Touch down at starting point
