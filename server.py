@@ -5,6 +5,7 @@ import sys
 import signal
 import platform
 import logging
+import base64
 from typing import Optional, Coroutine
 try:
     from websockets.legacy.client import WebSocketClientProtocol
@@ -12,6 +13,7 @@ except ImportError:  # websockets >=12 removed legacy package
     from websockets.client import WebSocketClientProtocol  # type: ignore[attr-defined]
 from io import BytesIO
 
+import requests
 from aiohttp import web
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -41,6 +43,54 @@ class Colors:
 
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+# --- API 解码工具 ---
+def decode_api_response(encoded_data: str) -> dict:
+    """Decode base64 encoded API response from cg.163.com"""
+    try:
+        raw_bytes = base64.b64decode(encoded_data)
+    except Exception:
+        return {}
+
+    # Find the decryption key by detecting JSON start pattern
+    decode_key = None
+    if len(raw_bytes) >= 2:
+        first_byte = raw_bytes[0]
+        second_byte = raw_bytes[1]
+        for key_candidate in range(256):
+            char1 = chr((first_byte - key_candidate) % 256)
+            char2 = chr((second_byte - key_candidate) % 256)
+            if char1 == "{" and char2 == "\"":
+                decode_key = key_candidate
+                break
+
+    if decode_key is None:
+        return {}
+
+    decoded_str = "".join(chr((b - decode_key) % 256) for b in raw_bytes)
+    try:
+        return json.loads(decoded_str)
+    except json.JSONDecodeError:
+        return {}
+
+
+def fetch_user_info(token: str) -> dict:
+    """Fetch user info including remaining game time from cg.163.com API"""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(
+            "https://n.cg.163.com/api/v2/users/@me",
+            headers=headers,
+            timeout=10
+        )
+        if response.status_code != 200:
+            return {}
+        return decode_api_response(response.text)
+    except Exception as e:
+        logging.warning(f"Failed to fetch user info: {e}")
+        return {}
+
 
 # --- 全局状态 ---
 class AppState:
@@ -139,12 +189,26 @@ async def handle_info(request: web.Request):
             "status": "connecting" if app_state.cloud_game_task and not app_state.cloud_game_task.done() else "disconnected",
             "message": "Cloud gaming service not ready or not connected."
         })
-    
-    return web.json_response({
+
+    # Fetch remaining game time from API
+    remaining_time_seconds = None
+    if app_state.token:
+        loop = asyncio.get_running_loop()
+        user_info = await loop.run_in_executor(None, fetch_user_info, app_state.token)
+        if user_info:
+            # free_time_left is remaining mobile game time in seconds
+            remaining_time_seconds = user_info.get("free_time_left")
+
+    response_data = {
         "status": "ok",
         "width": app_state.width,
         "height": app_state.height
-    })
+    }
+
+    if remaining_time_seconds is not None:
+        response_data["remaining_time"] = remaining_time_seconds
+
+    return web.json_response(response_data)
 
 async def handle_screencap(request: web.Request):
     if not app_state.is_ready or not app_state.snapshotter:
@@ -193,39 +257,52 @@ async def handle_swipe(request: web.Request):
 
     logging.warning(f"Action: Swipe from ({start_x}, {start_y}) to ({end_x}, {end_y}) in {swipe_duration}ms")
 
-    # Swipe requires: press -> drag -> release sequence
-    # Cloud game touch protocol uses event codes: press=1, drag=2, release=3
-    
+    # Cloud game touch protocol:
+    # - Event codes: down=1, move=2, up=3
+    # - Coordinates must be normalized to 0-65535 range
+    # - Formula: normalized = 65535 * pixel // dimension
+
+    def normalize_coord(pixel_val: int, dimension: int) -> int:
+        """Normalize pixel coordinate to 0-65535 range"""
+        clamped = max(0, min(pixel_val, dimension - 1))
+        return int((65535 * clamped) // dimension)
+
+    # Get current screen dimensions
+    screen_width = app_state.width
+    screen_height = app_state.height
+
     num_points = max(5, swipe_duration // 30)
     interval = swipe_duration / 1000.0 / num_points
     touch_id = 0
-    
-    # Create input command for cloud game
-    def create_input_cmd(evt_type: int, px: int, py: int, tid: int) -> dict:
+
+    def create_touch_cmd(evt_type: int, px: int, py: int, tid: int) -> dict:
+        """Create touch input command with normalized coordinates"""
+        norm_x = normalize_coord(px, screen_width)
+        norm_y = normalize_coord(py, screen_height)
         timestamp = str(int(time.time() * 1000))
-        cmd_str = f"{evt_type} {px} {py} {tid}"
+        cmd_str = f"{evt_type} {norm_x} {norm_y} {tid}"
         return {"id": timestamp, "op": "input", "data": {"cmd": cmd_str}}
-    
-    # Press at starting point
-    press_cmd = create_input_cmd(1, start_x, start_y, touch_id)
-    await send_action(app_state.sock, press_cmd)
+
+    # Touch down at starting point
+    down_cmd = create_touch_cmd(1, start_x, start_y, touch_id)
+    await send_action(app_state.sock, down_cmd)
     await asyncio.sleep(0.02)
-    
-    # Drag through path points
+
+    # Move through path points
     delta_x = end_x - start_x
     delta_y = end_y - start_y
     for step in range(1, num_points + 1):
         progress = step / num_points
         current_x = int(start_x + delta_x * progress)
         current_y = int(start_y + delta_y * progress)
-        
-        drag_cmd = create_input_cmd(2, current_x, current_y, touch_id)
-        await send_action(app_state.sock, drag_cmd)
+
+        move_cmd = create_touch_cmd(2, current_x, current_y, touch_id)
+        await send_action(app_state.sock, move_cmd)
         await asyncio.sleep(interval)
-    
-    # Release at ending point
-    release_cmd = create_input_cmd(3, end_x, end_y, touch_id)
-    await send_action(app_state.sock, release_cmd)
+
+    # Touch up at ending point
+    up_cmd = create_touch_cmd(3, end_x, end_y, touch_id)
+    await send_action(app_state.sock, up_cmd)
 
     return web.json_response({"status": "ok"})
 
