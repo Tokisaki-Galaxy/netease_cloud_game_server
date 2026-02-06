@@ -185,44 +185,47 @@ async def handle_swipe(request: web.Request):
 
     try:
         data = await request.json()
-        x1, y1 = int(data['x1']), int(data['y1'])
-        x2, y2 = int(data['x2']), int(data['y2'])
-        duration_ms = int(data['duration'])
+        start_x, start_y = int(data['x1']), int(data['y1'])
+        end_x, end_y = int(data['x2']), int(data['y2'])
+        swipe_duration = int(data['duration'])
     except (json.JSONDecodeError, KeyError, ValueError):
         return web.json_response({"status": "error", "message": "Invalid request body"}, status=400)
 
-    logging.warning(f"Action: Swipe from ({x1}, {y1}) to ({x2}, {y2}) in {duration_ms}ms")
+    logging.warning(f"Action: Swipe from ({start_x}, {start_y}) to ({end_x}, {end_y}) in {swipe_duration}ms")
 
-    # Swipe simulation: touch down -> touch move(s) -> touch up
-    # Use multiple intermediate points for smoother swipe
+    # Swipe requires: press -> drag -> release sequence
+    # Cloud game touch protocol uses event codes: press=1, drag=2, release=3
     
-    # Get screen dimensions for coordinate normalization
-    width = app_state.width
-    height = app_state.height
+    num_points = max(5, swipe_duration // 30)
+    interval = swipe_duration / 1000.0 / num_points
+    touch_id = 0
     
-    # Calculate number of steps based on duration (aim for ~20-50ms per step)
-    steps = max(1, int(duration_ms) // 30)
-    step_delay = duration_ms / 1000.0 / steps
+    # Create input command for cloud game
+    def create_input_cmd(evt_type: int, px: int, py: int, tid: int) -> dict:
+        timestamp = str(int(time.time() * 1000))
+        cmd_str = f"{evt_type} {px} {py} {tid}"
+        return {"id": timestamp, "op": "input", "data": {"cmd": cmd_str}}
     
-    # 1. Touch down at start position
-    touch_down = pack_message("td", {"x": x1, "y": y1, "pointer_id": 0, "width": width, "height": height})
-    await send_action(app_state.sock, touch_down)
+    # Press at starting point
+    press_cmd = create_input_cmd(1, start_x, start_y, touch_id)
+    await send_action(app_state.sock, press_cmd)
     await asyncio.sleep(0.02)
     
-    # 2. Touch move through intermediate points
-    for i in range(1, steps + 1):
-        # Linear interpolation between start and end points
-        t = i / steps
-        x = int(x1 + (x2 - x1) * t)
-        y = int(y1 + (y2 - y1) * t)
+    # Drag through path points
+    delta_x = end_x - start_x
+    delta_y = end_y - start_y
+    for step in range(1, num_points + 1):
+        progress = step / num_points
+        current_x = int(start_x + delta_x * progress)
+        current_y = int(start_y + delta_y * progress)
         
-        touch_move = pack_message("tm", {"x": x, "y": y, "pointer_id": 0, "width": width, "height": height})
-        await send_action(app_state.sock, touch_move)
-        await asyncio.sleep(step_delay)
+        drag_cmd = create_input_cmd(2, current_x, current_y, touch_id)
+        await send_action(app_state.sock, drag_cmd)
+        await asyncio.sleep(interval)
     
-    # 3. Touch up at end position
-    touch_up = pack_message("tu", {"x": x2, "y": y2, "pointer_id": 0, "width": width, "height": height})
-    await send_action(app_state.sock, touch_up)
+    # Release at ending point
+    release_cmd = create_input_cmd(3, end_x, end_y, touch_id)
+    await send_action(app_state.sock, release_cmd)
 
     return web.json_response({"status": "ok"})
 
