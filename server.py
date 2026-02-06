@@ -260,11 +260,11 @@ async def handle_swipe(request: web.Request):
     # Cloud game touch protocol:
     # - Event codes: down=1, move=2, up=3
     # - Coordinates must be normalized to 0-65535 range
-    # - Formula: normalized = ceil(65535 * pixel / dimension)
+    # - Formula: normalized = 65535 * pixel // dimension
 
     def normalize_coord(pixel_val: int, dimension: int) -> int:
         """Normalize pixel coordinate to 0-65535 range"""
-        clamped = max(0, min(pixel_val, dimension))
+        clamped = max(0, min(pixel_val, dimension - 1))
         return int((65535 * clamped) // dimension)
 
     # Get current screen dimensions
