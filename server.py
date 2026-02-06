@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import sys
+import signal
 import platform
 import logging
 from typing import Optional, Coroutine
@@ -52,6 +53,7 @@ class AppState:
         self.height = HEIGHT
         self.token: Optional[str] = None
         self.cloud_game_task: Optional[asyncio.Task] = None
+        self.shutdown_event: Optional[asyncio.Event] = None
 
     def reset(self):
         self.pc = None
@@ -183,31 +185,47 @@ async def handle_swipe(request: web.Request):
 
     try:
         data = await request.json()
-        x1, y1 = int(data['x1']), int(data['y1'])
-        x2, y2 = int(data['x2']), int(data['y2'])
-        duration_ms = int(data['duration'])
+        start_x, start_y = int(data['x1']), int(data['y1'])
+        end_x, end_y = int(data['x2']), int(data['y2'])
+        swipe_duration = int(data['duration'])
     except (json.JSONDecodeError, KeyError, ValueError):
         return web.json_response({"status": "error", "message": "Invalid request body"}, status=400)
 
-    logging.warning(f"Action: Swipe from ({x1}, {y1}) to ({x2}, {y2}) in {duration_ms}ms")
+    logging.warning(f"Action: Swipe from ({start_x}, {start_y}) to ({end_x}, {end_y}) in {swipe_duration}ms")
 
-    # 模拟滑动需要 "按下 -> 移动 -> 松开"
-    # 1. 先移动鼠标到目标位置
-    move_action = pack_message("mm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, move_action)
-    await asyncio.sleep(0.05) # 短暂等待，模拟真实操作
-
-    # 2. 再执行点击操作
-    click_action = pack_message("cm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, click_action)
-
-    # 3. 再执行移动操作
-    click_action = pack_message("cm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, click_action)
-
-    # 4. 再执行点击操作
-    click_action = pack_message("cm", {"x": x1, "y": y1})
-    await send_action(app_state.sock, click_action)
+    # Swipe requires: press -> drag -> release sequence
+    # Cloud game touch protocol uses event codes: press=1, drag=2, release=3
+    
+    num_points = max(5, swipe_duration // 30)
+    interval = swipe_duration / 1000.0 / num_points
+    touch_id = 0
+    
+    # Create input command for cloud game
+    def create_input_cmd(evt_type: int, px: int, py: int, tid: int) -> dict:
+        timestamp = str(int(time.time() * 1000))
+        cmd_str = f"{evt_type} {px} {py} {tid}"
+        return {"id": timestamp, "op": "input", "data": {"cmd": cmd_str}}
+    
+    # Press at starting point
+    press_cmd = create_input_cmd(1, start_x, start_y, touch_id)
+    await send_action(app_state.sock, press_cmd)
+    await asyncio.sleep(0.02)
+    
+    # Drag through path points
+    delta_x = end_x - start_x
+    delta_y = end_y - start_y
+    for step in range(1, num_points + 1):
+        progress = step / num_points
+        current_x = int(start_x + delta_x * progress)
+        current_y = int(start_y + delta_y * progress)
+        
+        drag_cmd = create_input_cmd(2, current_x, current_y, touch_id)
+        await send_action(app_state.sock, drag_cmd)
+        await asyncio.sleep(interval)
+    
+    # Release at ending point
+    release_cmd = create_input_cmd(3, end_x, end_y, touch_id)
+    await send_action(app_state.sock, release_cmd)
 
     return web.json_response({"status": "ok"})
 
@@ -312,7 +330,10 @@ async def run_cloud_game():
         else:
             print(f"{Colors.RED}[!] Failed to start video stream. API will not be functional.{Colors.RESET}", file=sys.stderr)
 
-        await asyncio.Event().wait()
+        # Use a cancellable wait instead of Event().wait()
+        # This allows the task to be properly cancelled by signals
+        while True:
+            await asyncio.sleep(1)
 
     except asyncio.CancelledError:
         print(f"\n{Colors.CYAN}[*] Cloud game task cancelled.{Colors.RESET}")
@@ -363,10 +384,11 @@ async def cleanup_background_tasks(app: web.Application):
             pass
 
 # --- 主函数 ---
-def main():
+async def run_server():
+    """Run the aiohttp server with proper signal handling."""
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s')
-    access_log = logging.getLogger("aiohttp.access")#.setLevel(logging.WARNING)
+    access_log = logging.getLogger("aiohttp.access")
 
     app = web.Application()
     app.add_routes([
@@ -382,10 +404,56 @@ def main():
     
     app.on_cleanup.append(cleanup_background_tasks)
     
+    runner = web.AppRunner(app, access_log=access_log)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    
     print(f"{Colors.GREEN}{Colors.BOLD}[✓] API server is running at http://{HOST}:{PORT}{Colors.RESET}")
     print(f"{Colors.YELLOW}Send POST to /start to connect to the cloud game.{Colors.RESET}")
+    print(f"{Colors.YELLOW}(Press CTRL+C to quit){Colors.RESET}")
     
-    web.run_app(app, host=HOST, port=PORT, access_log=access_log)
+    # Create shutdown event
+    shutdown_event = asyncio.Event()
+    
+    # Setup signal handlers
+    loop = asyncio.get_running_loop()
+    
+    def signal_handler():
+        print(f"\n{Colors.CYAN}[*] Shutdown signal received...{Colors.RESET}")
+        shutdown_event.set()
+    
+    # Register signal handlers
+    # Note: loop.add_signal_handler() is not supported on Windows event loops,
+    # so the KeyboardInterrupt fallback in main() is needed for Windows support
+    if platform.system() != "Windows":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
+    
+    try:
+        # Wait for shutdown signal
+        await shutdown_event.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print(f"{Colors.CYAN}[*] Shutting down server...{Colors.RESET}")
+        # Cleanup cloud game task if running
+        if app_state.cloud_game_task and not app_state.cloud_game_task.done():
+            app_state.cloud_game_task.cancel()
+            try:
+                await app_state.cloud_game_task
+            except asyncio.CancelledError:
+                pass
+        await runner.cleanup()
+        print(f"{Colors.GREEN}[✓] Server stopped.{Colors.RESET}")
+
+def main():
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        # This handles Ctrl+C on Windows
+        print(f"\n{Colors.GREEN}[✓] Server stopped by user.{Colors.RESET}")
 
 if __name__ == "__main__":
     main()
